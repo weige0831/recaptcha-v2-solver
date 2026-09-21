@@ -16,3 +16,6 @@ __pycache__/
 *.jsonl
 results.md
 summary.md
+
+# 批量测试产物
+stability/

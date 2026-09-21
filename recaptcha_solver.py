@@ -35,12 +35,29 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- 配置选项 ---
 ENABLE_IMAGE_PREPROCESSING = True
-GROUNDING_DINO_CONFIDENCE = 0.25
-# 被 Google 提示"请选择更多"后，下一轮降阈值重检一次
-# （实测首轮常漏掉 0.27~0.31 置信度的格子，白费一轮）
+# 首轮检测的置信度门槛。实测 0.25 会收进大量"目标被格子边界切成两半"产生的
+# 边缘框（同一物体在同一道边界上被检出多次），在 "if there are none, click skip"
+# 这类题上直接变成误点。首轮取高门槛保精度，漏掉的部分由"选更多"后的降阈值重检兜回。
+GROUNDING_DINO_CONFIDENCE = 0.28
 RELAXED_DINO_CONFIDENCE = 0.15
-YOLO_CONFIDENCE = 0.25
-RELAXED_YOLO_CONFIDENCE = 0.12
+YOLO_CONFIDENCE = 0.30
+RELAXED_YOLO_CONFIDENCE = 0.15
+# 检测框 → 格子的映射门槛：方框落在某格内的面积占方框总面积达到此比例即算命中。
+# reCAPTCHA 的规则是"勾选所有包含目标一部分的方格"，只点中心格会漏。
+BOX_TILE_MIN_BOX_FRAC = 0.25
+# YOLO 推理输入尺寸。crop 本身约 390px，默认 640 是白白放大、白花时间
+YOLO_IMGSZ = int(os.environ.get("V2_YOLO_IMGSZ", "448"))
+# 是否落盘调试图（全页 PNG + crop + 增强图）。批量测试关掉可省每轮约 0.3~1s
+SAVE_DEBUG_SHOTS = os.environ.get("V2_SAVE_SHOTS", "1") != "0"
+# 打印每轮及各阶段耗时（V2_TIMING=1），用于定位时间去向
+TIMING = os.environ.get("V2_TIMING", "0") != "0"
+# 成功拿到 token 后先落盘的路径。浏览器收尾偶尔会无限期挂起（实测），
+# 结果必须先落地，否则"已经解出来了"会被当成失败
+TOKEN_STASH_FILE = os.path.join(tempfile.gettempdir(), "recaptcha_last_token.txt")
+# 收尾（page.close / 浏览器关闭）看门狗：超时未关完就强制退出进程，
+# 避免整个进程挂死。只建议在"一轮一进程"的批处理用法下开启
+FORCE_EXIT_ON_CLOSE_HANG = os.environ.get("V2_FORCE_EXIT", "1") != "0"
+BROWSER_CLOSE_TIMEOUT = float(os.environ.get("V2_CLOSE_TIMEOUT", "25"))
 GROUNDING_DINO_DEBUG = False  # 调试模式
 DEBUG = True  # 全局调试开关
 
@@ -105,6 +122,44 @@ WARN_MARKERS = {
 
 # 连续多少轮拿不到挑战图块就判定为被限流：与其耗光重试次数，不如及早报错
 MAX_NO_TILE_STREAK = 8
+# 连续多少轮"零检出"就主动换题（一道题不可能一直一个目标都没有）
+BLANK_ROUNDS_BEFORE_RELOAD = 4
+# 连续多少轮挑战区不在视口内就整页重载。实测会一直卡在 y=-9875，
+# scrollTo 无效，不重载就会空转到轮数上限
+OFFSCREEN_ROUNDS_BEFORE_RELOAD = 2
+
+
+def box_to_tiles(bx1, by1, bx2, by2, tile_w, tile_h, grid_side,
+                 min_box_frac=BOX_TILE_MIN_BOX_FRAC) -> Set[int]:
+    """检测框 → 需要点击的格子集合
+
+    reCAPTCHA 的判定规则是"勾选所有包含目标一部分的方格"，所以跨格的物体要把
+    覆盖到的格子都点上。只点中心所在那一格，正是"请选择更多"的主要来源。
+
+    判据用「方框落在某格内的面积占方框总面积的比例」，而不是「占该格面积的比例」——
+    后者对细长物体不成立：一根立柱跨在两格之间时，每格只占格子面积的一小部分，
+    但两格确实都含有目标的一部分。
+    """
+    out: Set[int] = set()
+    if bx2 <= bx1 or by2 <= by1:
+        return out
+    box_area = (bx2 - bx1) * (by2 - by1)
+    c0 = max(0, int(bx1 // tile_w))
+    c1 = min(grid_side - 1, int((bx2 - 1e-6) // tile_w))
+    r0 = max(0, int(by1 // tile_h))
+    r1 = min(grid_side - 1, int((by2 - 1e-6) // tile_h))
+    for row in range(r0, r1 + 1):
+        for col in range(c0, c1 + 1):
+            ox = max(0.0, min(bx2, (col + 1) * tile_w) - max(bx1, col * tile_w))
+            oy = max(0.0, min(by2, (row + 1) * tile_h) - max(by1, row * tile_h))
+            if box_area and (ox * oy) / box_area >= min_box_frac:
+                out.add(row * grid_side + col)
+    if not out:
+        # 兜底：方框大跨界、每格都不到比例时，至少取中心所在格
+        col = min(grid_side - 1, max(0, int(((bx1 + bx2) / 2) // tile_w)))
+        row = min(grid_side - 1, max(0, int(((by1 + by2) / 2) // tile_h)))
+        out.add(row * grid_side + col)
+    return out
 
 
 def find_marker(blob: str, markers: dict) -> Optional[str]:
@@ -195,7 +250,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <title>reCAPTCHA Solver</title>
     <script src="https://www.google.com/recaptcha/api.js" async defer></script>
     <style>
-        body { font-family: Arial; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5; }
+        /* 禁止页面滚动：挑战层比 100vh 高时页面一旦可滚动，
+           Playwright 点击时的自动滚动会把挑战区推出视口，坐标变成大负数，
+           截图为空白、按钮也点不动（整轮空转的根因） */
+        html, body { height: 100%; overflow: hidden; }
+        body { font-family: Arial; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }
         .container { text-align: center; padding: 20px; }
     </style>
 </head>
@@ -330,7 +389,7 @@ def preprocess_image(img):
         return Image.fromarray(img_rgb)
     if strategy == 'denoise_only':
         h_luminance = 10 if quality['noise_level'] > 70 else 6
-        img_denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, h_luminance, h_luminance, 7, 21)
+        img_denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, h_luminance, h_luminance, 7, 11)
         if quality['blockiness'] > 40:
             img_denoised = cv2.bilateralFilter(img_denoised, 5, 50, 50)
         img_rgb = cv2.cvtColor(img_denoised, cv2.COLOR_BGR2RGB)
@@ -342,11 +401,11 @@ def preprocess_image(img):
         b = cv2.add(b, 128 - int(np.mean(b)))
         lab_corrected = cv2.merge([l, a, b])
         img_corrected = cv2.cvtColor(lab_corrected, cv2.COLOR_LAB2BGR)
-        img_denoised = cv2.fastNlMeansDenoisingColored(img_corrected, None, 3, 3, 7, 21)
+        img_denoised = cv2.fastNlMeansDenoisingColored(img_corrected, None, 3, 3, 7, 11)
         img_rgb = cv2.cvtColor(img_denoised, cv2.COLOR_BGR2RGB)
         return Image.fromarray(img_rgb)
     if strategy == 'gentle':
-        img_denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, 4, 4, 7, 21)
+        img_denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, 4, 4, 7, 11)
         lab = cv2.cvtColor(img_denoised, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
@@ -355,7 +414,7 @@ def preprocess_image(img):
         img_result = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
         img_rgb = cv2.cvtColor(img_result, cv2.COLOR_BGR2RGB)
         return Image.fromarray(img_rgb)
-    img_denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, 3, 3, 7, 21)
+    img_denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, 3, 3, 7, 11)
     lab = cv2.cvtColor(img_denoised, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -516,8 +575,21 @@ class RecaptchaSolver:
         return self
     
     def __exit__(self, *args):
-        if self.browser:
+        if not self.browser:
+            return
+        # 浏览器关闭实测会无限期挂起（表现为"已验证成功但进程不退出"）。
+        # 加看门狗：关得掉就正常关，关不掉就在超时后强制退出。
+        # 批处理是一轮一进程，强退没有副作用（V2_FORCE_EXIT=0 可关掉）。
+        watchdog = None
+        if FORCE_EXIT_ON_CLOSE_HANG:
+            watchdog = threading.Timer(BROWSER_CLOSE_TIMEOUT, lambda: os._exit(0))
+            watchdog.daemon = True
+            watchdog.start()
+        try:
             self.browser.__exit__(*args)
+        finally:
+            if watchdog:
+                watchdog.cancel()
     
     def solve(self, sitekey: str, url: str, timeout: int = DEFAULT_SOLVE_TIMEOUT,
               mode: Optional[str] = None) -> str:
@@ -554,11 +626,31 @@ class RecaptchaSolver:
                 token = self._solve_audio_challenge(page, timeout)
             else:
                 token = self._solve_challenge(page, timeout)
+            # 先把结果落地再收尾：浏览器收尾实测会无限期挂起，
+            # 不能让"已经解出来了"因为收尾卡死而被记成失败
+            self._stash_token(token)
             return token
         finally:
             RecaptchaSolver._last_solve_finished = time.time()
             self._write_last_finished()
-            page.close()
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _stash_token(token: str) -> None:
+        """立刻把 token 写到临时文件，并打印机器可读的成功标记
+
+        收尾阶段（page.close / 浏览器关闭）可能挂起，批处理应以这个标记判定成功，
+        而不是只看进程退出码。
+        """
+        try:
+            with open(TOKEN_STASH_FILE, "w", encoding="utf-8") as f:
+                f.write(token or "")
+        except Exception:
+            pass
+        print(f"RESULT_OK token_len={len(token or '')}", flush=True)
     
     @staticmethod
     def _read_last_finished() -> Optional[float]:
@@ -640,6 +732,26 @@ class RecaptchaSolver:
                 print(f"   ⚠️ GroundingDINO 检测出错: {e}")
             return []
     
+    @staticmethod
+    def _box_in_view(page: Page, box: dict) -> bool:
+        """判断元素框是否落在视口内（允许少量出界）
+
+        挑战层被滚出视口时 y 会是很大的负数，此时截图是空白图。
+        """
+        try:
+            vw = page.evaluate("window.innerWidth") or 0
+            vh = page.evaluate("window.innerHeight") or 0
+        except Exception:
+            return True  # 取不到视口信息就不拦
+        if not vw or not vh:
+            return True
+        x, y = box.get("x", 0), box.get("y", 0)
+        w, h = box.get("width", 0), box.get("height", 0)
+        if w < 20 or h < 20:
+            return False
+        # 允许上下各 20px 的溢出余量
+        return (y > -20) and (y + h < vh + 20) and (x > -20) and (x + w < vw + 20)
+
     def _click_anchor(self, page: Page, main_frame) -> bool:
         """点击主验证框，返回是否点成功
         
@@ -676,7 +788,9 @@ class RecaptchaSolver:
         """内部方法：解决图片挑战"""
         self._load_models()
         start_time = time.time()
-        max_retries = 30
+        # 每轮已压到约 4~5s，30 轮的上限反而先于时间上限触发。
+        # 放宽到 60，让 420s 的时间预算成为真正的约束。
+        max_retries = 60
         current_try = 0
         clicked_indices_history: Set[int] = set()
         last_category = None
@@ -684,6 +798,8 @@ class RecaptchaSolver:
         anchor_clicked = False
         warned_quota = False
         no_tile_hits = 0
+        blank_rounds = 0         # 连续"零检出"的轮数，用来在空转时主动换题
+        offscreen_rounds = 0     # 连续"挑战区不在视口内"的轮数，用于触发整页重载
         relaxed_retry = False    # 上一轮被提示"请选择更多" → 本轮降阈值重检一次
         dynamic_category = None  # 经 DOM 行为确认为动态题的类别（题干措辞不可靠）
         
@@ -691,6 +807,25 @@ class RecaptchaSolver:
         print("⏳ 等待 reCAPTCHA 加载...")
         page.wait_for_selector("iframe[title='reCAPTCHA']", timeout=30000)
         
+        # 统计图片 payload 的拉取次数。动态题点完图块后 Google 会重新拉取被替换格子
+        # 的新图，计数增加才是"图片确实被替换过"的硬信号。
+        # 只看"图块已加载且不透明"不够用：替换还没开始时，已被清掉的旧图同样满足
+        # 条件，于是截到旧图、检测为空 → 直接提交 → Google 报"请同时勾选新的图片"。
+        # 实测这是最主要的失败模式（31 次 vs 漏选 5 次）。
+        payload_hits = [0]
+
+        def _on_payload(resp):
+            try:
+                u = resp.url
+                if "/recaptcha/api2/payload" in u and "/payload/audio" not in u:
+                    payload_hits[0] += 1
+            except Exception:
+                pass
+
+        page.on("response", _on_payload)
+        
+        t_prev_round = time.time()
+        t_stage = time.time()
         main_frame = page.frame_locator("iframe[title='reCAPTCHA']")
         
         time.sleep(1)
@@ -698,6 +833,10 @@ class RecaptchaSolver:
         while current_try < max_retries and time.time() - start_time < timeout:
             current_try += 1
             print(f"\n🔄 --- 第 {current_try} 次循环检测 ---")
+            if TIMING and current_try > 1:
+                print(f"   [计时] 上一轮共 {time.time() - t_prev_round:.1f}s")
+            t_prev_round = time.time()
+            t_stage = time.time()
             
             # 检查是否成功
             try:
@@ -708,7 +847,7 @@ class RecaptchaSolver:
             except:
                 pass
             
-            time.sleep(0.6)
+            time.sleep(0.3)
             
             # Google 端状态检测：硬限制连续两次命中才中止，避免把瞬时状态误判；
             # 配额提示只警告一次，不中止（实测该提示存在时仍能正常出题）
@@ -832,12 +971,56 @@ class RecaptchaSolver:
                 continue
             
             # 截图和识别
-            time.sleep(0.6)
+            time.sleep(0.2)
             dpr = page.evaluate("window.devicePixelRatio")
             ele_box = target_ele.bounding_box()
             if not ele_box:
                 print("⚠️ 无法获取元素位置")
                 continue
+            # 挑战区可能被滚出视口（点击带来的自动滚动等），此时坐标是大负数，
+            # 截出来是空白图，检测必然为空、按钮也点不动 —— 表现为整轮空转。
+            # 先滚回顶部重测，仍越界就跳过本轮，不要拿空白图去点提交。
+            if not self._box_in_view(page, ele_box):
+                offscreen_rounds += 1
+                print(f"⚠️ 挑战区不在视口内 y={ele_box.get('y', 0):.0f} "
+                      f"({offscreen_rounds}/{OFFSCREEN_ROUNDS_BEFORE_RELOAD})")
+                # 先试温和手段：滚回顶部并重测
+                try:
+                    page.evaluate("window.scrollTo(0, 0)")
+                    time.sleep(0.3)
+                    ele_box = target_ele.bounding_box()
+                except Exception:
+                    ele_box = None
+                if ele_box and self._box_in_view(page, ele_box):
+                    print(f"   ✅ 滚回顶部后已恢复 y={ele_box['y']:.0f}")
+                    offscreen_rounds = 0
+                elif offscreen_rounds >= OFFSCREEN_ROUNDS_BEFORE_RELOAD:
+                    # 温和手段无效，整页重载重建组件（成因无关的恢复）
+                    print("   🔄 整页重载以重建组件")
+                    try:
+                        page.reload(wait_until="networkidle", timeout=30000)
+                    except Exception as e:
+                        print(f"   ⚠️ 重载异常 {type(e).__name__}")
+                    time.sleep(2)
+                    try:
+                        page.wait_for_selector("iframe[title='reCAPTCHA']", timeout=30000)
+                    except Exception:
+                        pass
+                    # 重置本题状态，避免沿用旧会话的记账
+                    anchor_clicked = False
+                    clicked_indices_history.clear()
+                    last_category = None
+                    dynamic_category = None
+                    relaxed_retry = False
+                    blank_rounds = 0
+                    offscreen_rounds = 0
+                    payload_hits[0] = 0
+                    continue
+                else:
+                    print("   ⚠️ 仍在视口外，跳过本轮")
+                    continue
+            else:
+                offscreen_rounds = 0
             
             x1 = int(ele_box['x'] * dpr)
             y1 = int(ele_box['y'] * dpr)
@@ -847,7 +1030,7 @@ class RecaptchaSolver:
             print(f"📐 坐标: dpr={dpr}, box=({x1},{y1},{x2},{y2})")
             
             # 等待图片完全加载后截图
-            time.sleep(1)  # 基础等待时间
+            time.sleep(0.4)  # 基础等待（后面还有图块就绪检查兜底）
             
             # 尝试检测图片是否加载完成
             try:
@@ -872,15 +1055,21 @@ class RecaptchaSolver:
                     """)
                     if not all_loaded:
                         print("   ⏳ 等待图片加载...")
-                        time.sleep(1.0)  # 额外等待
+                        time.sleep(0.3)  # 额外等待
             except:
                 pass  # 忽略错误
             
-            time.sleep(1)
+            time.sleep(0.3)
+            if TIMING:
+                print(f"   [计时] 截图前准备 {time.time()-t_stage:.1f}s")
+            t_shot = time.time()
             full_screenshot = page.screenshot()
+            if TIMING:
+                print(f"   [计时] page.screenshot {time.time()-t_shot:.1f}s")
+            t_stage = time.time()
             
             # 保存截图
-            if DEBUG:
+            if DEBUG and SAVE_DEBUG_SHOTS:
                 full_path = os.path.join(SCREENSHOT_DIR, f"full_{current_try}.png")
                 with open(full_path, "wb") as f:
                     f.write(full_screenshot)
@@ -893,7 +1082,7 @@ class RecaptchaSolver:
                 continue
             
             # 保存裁剪截图
-            if DEBUG:
+            if DEBUG and SAVE_DEBUG_SHOTS:
                 crop_path = os.path.join(SCREENSHOT_DIR, f"crop_{current_try}.jpg")
                 with open(crop_path, "wb") as f:
                     f.write(image_cp)
@@ -904,7 +1093,7 @@ class RecaptchaSolver:
             if ENABLE_IMAGE_PREPROCESSING:
                 try:
                     img_enhanced = preprocess_image(img_obj)
-                    if DEBUG:
+                    if DEBUG and SAVE_DEBUG_SHOTS:
                         enhanced_path = os.path.join(SCREENSHOT_DIR, f"enhanced_{current_try}.jpg")
                         img_enhanced.save(enhanced_path, "JPEG")
                         print(f"🔧 保存增强截图: {enhanced_path}")
@@ -914,6 +1103,9 @@ class RecaptchaSolver:
             else:
                 img_enhanced = img_obj
             
+            if TIMING:
+                print(f"   [计时] 裁剪+预处理 {time.time()-t_stage:.1f}s")
+            t_det = time.time()
             img_w, img_h = img_obj.size
             tile_w = img_w / grid_side
             tile_h = img_h / grid_side
@@ -943,23 +1135,18 @@ class RecaptchaSolver:
                 
                 for box, score, label in detections:
                     bx1, by1, bx2, by2 = box
-                    # 使用检测框中心点确定所在格子
-                    center_x = (bx1 + bx2) / 2
-                    center_y = (by1 + by2) / 2
-                    col = int(center_x / tile_w)
-                    row = int(center_y / tile_h)
-                    if 0 <= row < grid_side and 0 <= col < grid_side:
-                        idx = row * grid_side + col
-                        if idx not in click_indices:
-                            click_indices.add(idx)
-                            print(f"      格子 [{row},{col}] 置信度: {score:.3f} ✓")
+                    hits = box_to_tiles(bx1, by1, bx2, by2, tile_w, tile_h, grid_side)
+                    new = sorted(hits - click_indices)
+                    click_indices |= hits
+                    if new:
+                        print(f"      格子 {new} 置信度: {score:.3f} ✓")
                 
                 print(f"   🦖 GroundingDINO 识别到目标格子: {sorted(list(click_indices))}")
             else:
                 # YOLO 检测
                 print(f"   🎯 使用 YOLO 检测: {target_classes}")
                 results = self._yolo_model(
-                    img_enhanced, verbose=False,
+                    img_enhanced, verbose=False, imgsz=YOLO_IMGSZ,
                     conf=RELAXED_YOLO_CONFIDENCE if relaxed_retry else YOLO_CONFIDENCE)
                 for r in results:
                     for box in r.boxes:
@@ -969,20 +1156,35 @@ class RecaptchaSolver:
                             bx1, by1, bx2, by2 = box.xyxy[0].tolist()
                             if DEBUG:
                                 print(f"      检测到 {cls_name} conf={conf:.3f} box=({int(bx1)},{int(by1)},{int(bx2)},{int(by2)})")
-                            # 使用检测框中心点确定所在格子
-                            center_x = (bx1 + bx2) / 2
-                            center_y = (by1 + by2) / 2
-                            col_idx = int(center_x / tile_w)
-                            row_idx = int(center_y / tile_h)
-                            if 0 <= row_idx < grid_side and 0 <= col_idx < grid_side:
-                                click_indices.add(row_idx * grid_side + col_idx)
+                            click_indices |= box_to_tiles(
+                                bx1, by1, bx2, by2, tile_w, tile_h, grid_side)
                 
                 print(f"   🎯 YOLO 识别到目标格子: {sorted(list(click_indices))}")
             
+            if TIMING:
+                print(f"   [计时] 检测推理 {time.time()-t_det:.1f}s")
             sorted_indices = sorted(list(click_indices))
             model_name = "GroundingDINO" if use_yolo_world else "YOLO"
             print(f"🎯 最终识别结果 ({model_name}): 需点击网格 {sorted_indices}")
             
+            # 空转守卫：连续多轮一个目标都检不出，说明这道题已经没法推进
+            # （图不对、类别判错、或题目本身有 none），主动换一道题，别耗到轮数上限
+            if not click_indices:
+                blank_rounds += 1
+                if blank_rounds >= BLANK_ROUNDS_BEFORE_RELOAD:
+                    print(f"   🔄 连续 {blank_rounds} 轮零检出，换成新题")
+                    blank_rounds = 0
+                    relaxed_retry = False
+                    try:
+                        reload_btn = recaptcha_frame.locator("#recaptcha-reload-button").first
+                        reload_btn.click(timeout=CLICK_TIMEOUT_MS)
+                        time.sleep(1.0)
+                    except Exception:
+                        pass
+                    continue
+            else:
+                blank_rounds = 0
+
             # 静态模式过滤已点击
             if not is_dynamic_mode and clicked_indices_history:
                 filtered_indices = [idx for idx in sorted_indices if idx not in clicked_indices_history]
@@ -993,6 +1195,7 @@ class RecaptchaSolver:
             # 执行点击
             if sorted_indices:
                 print(f"🖱️ 点击 {len(sorted_indices)} 个图块: {sorted_indices}")
+                payload_before = payload_hits[0]
                 click_order = sorted_indices.copy()
                 if len(click_order) > 2 and random.random() > 0.3:
                     random.shuffle(click_order)
@@ -1038,8 +1241,22 @@ class RecaptchaSolver:
                 poll_interval = 0.2   # 每 200ms 检查一次
                 t_wait_start = time.time()
                 
-                # 首先等待一小段时间让动画开始
-                time.sleep(0.5)
+                # 首先等"图片确实开始被替换"：被点格子的新图会重新拉一次 payload。
+                # 这一步是关键——直接进入就绪判断的话，替换尚未开始时旧图就已满足
+                # "已加载+不透明"，我们会截到旧图并检测为空。
+                t_repl = time.time()
+                while payload_hits[0] == payload_before and (time.time() - t_repl) < 8.0:
+                    time.sleep(0.2)
+                if TIMING:
+                    print(f"   [计时] 等新图拉取 {time.time()-t_repl:.1f}s")
+                new_payloads = payload_hits[0] - payload_before
+                if new_payloads > 0:
+                    print(f"   🔄 已拉取 {new_payloads} 张新图块，等待渲染完成...")
+                else:
+                    print("   ⚠️ 未观察到新图块拉取（可能没有可替换的格子）")
+                
+                # 再等动画开始
+                time.sleep(0.3)
                 
                 # 获取 iframe 的 frame 对象用于执行 JS
                 bframe_selector = "iframe[src*='recaptcha/api2/bframe'], iframe[src*='recaptcha/enterprise/bframe']"
@@ -1098,6 +1315,9 @@ class RecaptchaSolver:
                     
                     time.sleep(poll_interval)
                 
+                if TIMING:
+                    print(f"   [计时] 等渲染完成 {time.time()-t_wait_start:.1f}s")
+
                 if not loaded:
                     print(f"   ⚠️ 等待超时 ({max_wait_time:.0f}s)，继续下一轮检测")
                 
@@ -1112,7 +1332,7 @@ class RecaptchaSolver:
                 if verify_btn.is_enabled():
                     print("🖱️ 点击提交按钮...")
                     verify_btn.click(timeout=CLICK_TIMEOUT_MS)
-                    time.sleep(0.8)
+                    time.sleep(0.4)
                     
                     error_msgs = recaptcha_frame.locator("[class*='rc-imageselect-error']").all()
                     has_error = False
@@ -1121,7 +1341,7 @@ class RecaptchaSolver:
                         try:
                             if msg.is_visible():
                                 has_error = True
-                                err_text += " " + (msg.inner_text() or "")
+                                err_text += " " + (msg.inner_text(timeout=1000) or "")
                         except Exception:
                             pass
                     err_text = err_text.lower().strip()
@@ -1148,7 +1368,7 @@ class RecaptchaSolver:
                             relaxed_retry = True
                     else:
                         relaxed_retry = False
-                    time.sleep(1.0)
+                    time.sleep(0.6)
             except Exception as e:
                 print(f"⚠️ 验证按钮操作异常: {e}")
         
@@ -1336,7 +1556,7 @@ class RecaptchaSolver:
         try:
             el = bframe.query_selector(".rc-audiochallenge-error-message")
             if el:
-                t = (el.inner_text() or "").strip()
+                t = (el.inner_text(timeout=1000) or "").strip()
                 if t:
                     return t
         except Exception:
