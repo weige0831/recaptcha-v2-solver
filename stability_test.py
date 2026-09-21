@@ -21,6 +21,8 @@ import subprocess
 import sys
 import time
 
+import clash_api
+
 SOLVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recaptcha_solver.py")
 STABILITY_DIR = "stability"
 
@@ -47,7 +49,28 @@ def kill_tree(pid):
         pass
 
 
-def run_once(mode, idx, solve_timeout, tag, outdir, headed=False, url=None, sitekey=None):
+def rotate_node(nodes, idx):
+    """每次求解前换一个出口节点
+
+    音频接口的限流是按 IP 记的：同一 IP 连续解 8 次左右就开始返回
+    "your computer or network may be sending automated queries"。
+    轮换节点让每次求解都换新 IP，可绕开这个上限。
+    """
+    if not nodes:
+        return None
+    node = nodes[(idx - 1) % len(nodes)]
+    try:
+        from urllib.parse import quote as _q
+        st, _ = clash_api.api("PUT", "/proxies/" + _q(clash_api.GROUP, safe=""),
+                              {"name": node})
+        print(f"  [节点] 已切到 {node}  ({st})", flush=True)
+    except Exception as e:
+        print(f"  [节点] 切换失败 {type(e).__name__}: {e}", flush=True)
+    return node
+
+
+def run_once(mode, idx, solve_timeout, tag, outdir, headed=False, url=None, sitekey=None,
+             wall_timeout=None):
     log_path = os.path.join(outdir, f"run_{idx:02d}.log")
     cmd = [sys.executable, "-u", SOLVER,
            "--mode", mode,
@@ -59,7 +82,8 @@ def run_once(mode, idx, solve_timeout, tag, outdir, headed=False, url=None, site
         cmd += ["--url", url]
     if sitekey:
         cmd += ["--sitekey", sitekey]
-    wall_timeout = solve_timeout + STARTUP_MARGIN
+    # 求解器内部可能换节点重试多次，墙钟上限要按尝试次数放大
+    wall_timeout = wall_timeout or (solve_timeout + STARTUP_MARGIN)
     t0 = time.time()
     timed_out = False
     rc = None
@@ -106,6 +130,7 @@ def run_once(mode, idx, solve_timeout, tag, outdir, headed=False, url=None, site
 
     return {
         "idx": idx, "mode": mode, "ok": ok, "exit_code": rc, "timed_out": timed_out,
+        "attempts": 1,
         "dur": round(dur, 1),
         "solve_dur": round(solve_dur, 1) if solve_dur else None,
         "token_len": int(tl.group(1)) if tl else None,
@@ -118,6 +143,7 @@ def run_once(mode, idx, solve_timeout, tag, outdir, headed=False, url=None, site
 def summarize(results, mode, tag, outdir, wall):
     n = len(results)
     ok = [r for r in results if r["ok"]]
+    first_try = [r for r in ok if r.get("attempts", 1) == 1]
     bad = [r for r in results if not r["ok"]]
     rate = len(ok) / n * 100 if n else 0
     lines = []
@@ -126,6 +152,9 @@ def summarize(results, mode, tag, outdir, wall):
     lines.append(f"- 运行次数: {n}")
     lines.append(f"- 成功: {len(ok)}")
     lines.append(f"- **成功率: {rate:.0f}% ({len(ok)}/{n})**")
+    if any(r.get("attempts", 1) > 1 for r in results):
+        lines.append(f"- 其中一次通过: {len(first_try)}/{n}"
+                     f"（首次成功率 {len(first_try)/n*100:.0f}%）")
     if ok:
         dur = sorted(r["dur"] for r in ok)
         med = dur[len(dur) // 2]
@@ -167,6 +196,13 @@ def main():
     ap.add_argument("--headed", action="store_true", help="有头模式（默认无头）")
     ap.add_argument("--url", default=DEMO_URL)
     ap.add_argument("--sitekey", default=DEMO_SITEKEY)
+    ap.add_argument("--rotate-nodes", default="",
+                    help='每次求解前轮换出口节点，用 ;; 分隔（节点名本身含 |）')
+    ap.add_argument("--node-wait", type=float, default=4.0, help="切换节点后等待秒数")
+    ap.add_argument("--wall-timeout", type=float, default=0,
+                    help="单次运行的墙钟上限（秒），0=按求解超时自动推算")
+    ap.add_argument("--retries", type=int, default=0,
+                    help="失败后换节点重试的次数（0=不重试，如实记录单次成功率）")
     args = ap.parse_args()
 
     solve_timeout = args.timeout or DEFAULT_TIMEOUT[args.mode]
@@ -178,12 +214,34 @@ def main():
     print(f"输出目录: {outdir}")
     print("=" * 72, flush=True)
 
+    # 节点名里本身含 "|"（如 "🇸🇬 新加坡S01 | IEPL | x2"），所以用 ";;" 分隔
+    nodes = [n.strip() for n in args.rotate_nodes.split(";;") if n.strip()] if args.rotate_nodes else []
+    if nodes:
+        print(f"启用节点轮换: {len(nodes)} 个节点，每次求解前切换")
+
     results = []
     t_all = time.time()
     for i in range(1, args.runs + 1):
+        if nodes:
+            rotate_node(nodes, i)
+            time.sleep(args.node_wait)
         print(f"\n--- [{i}/{args.runs}] {args.mode} ---", flush=True)
         r = run_once(args.mode, i, solve_timeout, args.tag, outdir,
-                     headed=args.headed, url=args.url, sitekey=args.sitekey)
+                     headed=args.headed, url=args.url, sitekey=args.sitekey,
+                     wall_timeout=args.wall_timeout or None)
+        # 抽到信誉差的出口 IP 时题链会病态变长。失败后换一个节点再试，
+        # 而不是直接记失败。attempts 会如实记录用了几次。
+        attempt = 1
+        while (not r["ok"]) and attempt <= args.retries:
+            attempt += 1
+            print(f"  ↻ 失败，换节点重试（第 {attempt} 次尝试）", flush=True)
+            if nodes:
+                rotate_node(nodes, i + attempt * 97)  # 错开，确保换到不同节点
+                time.sleep(args.node_wait)
+            r = run_once(args.mode, i, solve_timeout, args.tag, outdir,
+                         headed=args.headed, url=args.url, sitekey=args.sitekey,
+                         wall_timeout=args.wall_timeout or None)
+            r["attempts"] = attempt
         results.append(r)
         mark = "✅" if r["ok"] else "❌"
         extra = "" if r["ok"] else f"  {r['reason']}"

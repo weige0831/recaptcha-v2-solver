@@ -19,6 +19,7 @@ import numpy as np
 import cv2
 import io
 import re
+import sys
 import time
 import os
 import base64
@@ -58,6 +59,13 @@ TOKEN_STASH_FILE = os.path.join(tempfile.gettempdir(), "recaptcha_last_token.txt
 # 避免整个进程挂死。只建议在"一轮一进程"的批处理用法下开启
 FORCE_EXIT_ON_CLOSE_HANG = os.environ.get("V2_FORCE_EXIT", "1") != "0"
 BROWSER_CLOSE_TIMEOUT = float(os.environ.get("V2_CLOSE_TIMEOUT", "25"))
+# 单次 solve 内部失败后换出口节点重试的次数（0=不重试）
+SOLVE_RETRIES = int(os.environ.get("V2_SOLVE_RETRIES", "2"))
+# 出口节点列表（Clash 节点名，用 ;; 分隔；节点名本身含 | 所以不能用它当分隔符）。
+# 非空时每次尝试前自动换一个节点，规避按 IP 记的限流与信誉惩罚。
+NODES = [n.strip() for n in os.environ.get("V2_NODES", "").split(";;") if n.strip()]
+# 切换出口节点后的等待秒数（等连接稳定，避免首次加载超时）
+NODE_SWITCH_WAIT = float(os.environ.get("V2_NODE_WAIT", "4"))
 GROUNDING_DINO_DEBUG = False  # 调试模式
 DEBUG = True  # 全局调试开关
 
@@ -465,13 +473,20 @@ class RecaptchaSolver:
                  min_interval: Optional[float] = None,
                  mode: Optional[str] = None,
                  whisper_model: Optional[str] = None,
-                 proxy: Optional[str] = None):
+                 proxy: Optional[str] = None,
+                 nodes: Optional[List[str]] = None,
+                 solve_retries: int = SOLVE_RETRIES):
         self.headless = headless
         self.humanize = humanize
         self.min_interval = MIN_SOLVE_INTERVAL if min_interval is None else min_interval
         self.mode = mode or SOLVE_MODE
         self.whisper_model_name = whisper_model or WHISPER_MODEL
         self.proxy = PROXY if proxy is None else proxy
+        # 出口节点列表（Clash 节点名）。非空时每次尝试前自动换一个，
+        # 用于规避"按 IP 记"的限流与信誉惩罚
+        self.nodes = nodes if nodes is not None else NODES
+        self.solve_retries = solve_retries
+        self._node_cursor = 0
         self.browser = None
         # 图片模型惰性加载：音频模式用不到 YOLO/GroundingDINO，
         # 没必要多花约 45s 和 1.3GB 内存。
@@ -606,6 +621,50 @@ class RecaptchaSolver:
         """
         self._respect_cooldown()
         solve_mode = (mode or self.mode or "image").lower()
+        total = max(1, int(self.solve_retries) + 1)
+        last_err = None
+        for attempt in range(1, total + 1):
+            # 每次尝试前换一个出口节点。抽到信誉差的 IP 时题链会病态变长
+            # （实测到 120 轮仍未完），换 IP 重试比在原 IP 上硬耗有效得多。
+            if self.nodes:
+                self._rotate_node(attempt)
+            try:
+                return self._attempt_once(sitekey, url, solve_mode, timeout)
+            except RecaptchaBlockedError:
+                # 限流恰好是"换个 IP 就能解"的典型（配额按 IP 记）。
+                # 只有在没有可换节点时才立刻上抛，交给上层退避。
+                if not self.nodes:
+                    raise
+                last_err = sys.exc_info()[1]
+                print("↻ 被 Google 限流，换出口节点重试")
+                if attempt == total:
+                    raise
+            except Exception as e:
+                last_err = e
+                if attempt < total:
+                    print(f"↻ 本次求解失败({type(e).__name__})，换出口节点重试 "
+                          f"({attempt}/{total - 1})")
+        raise last_err
+
+    def _rotate_node(self, attempt: int) -> None:
+        """切换到下一个出口节点（Clash）。失败不影响求解，只是少了换 IP 的效果"""
+        try:
+            from urllib.parse import quote as _q
+            import clash_api
+        except Exception as e:
+            print(f"   ⚠️ 无法导入 clash_api（{type(e).__name__}），跳过换节点")
+            return
+        node = self.nodes[(self._node_cursor + attempt - 1) % len(self.nodes)]
+        try:
+            st, _ = clash_api.api("PUT", "/proxies/" + _q(clash_api.GROUP, safe=""),
+                                  {"name": node})
+            print(f"   🌐 出口节点 -> {node}  ({st.split()[1] if ' ' in st else st})")
+        except Exception as e:
+            print(f"   ⚠️ 切换节点失败 {type(e).__name__}: {e}")
+        time.sleep(NODE_SWITCH_WAIT)
+
+    def _attempt_once(self, sitekey: str, url: str, solve_mode: str, timeout: int) -> str:
+        """一次完整尝试：开页 → 解挑战 → 取 token → 收尾"""
         page = self.browser.new_page()
         html_content = HTML_TEMPLATE.replace('{{SITEKEY}}', sitekey)
         
@@ -620,7 +679,19 @@ class RecaptchaSolver:
         
         try:
             print(f"🌐 正在打开页面: {url}  (模式: {solve_mode})")
-            page.goto(url, wait_until="networkidle")
+            # 切换出口节点后首次加载偶发超时（实测 TimeoutError），重试几次
+            last_err = None
+            for attempt in range(1, 4):
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=45000)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    print(f"   ⚠️ 页面加载失败({type(e).__name__})，第 {attempt}/3 次重试...")
+                    time.sleep(2)
+            if last_err is not None:
+                raise last_err
             time.sleep(2)
             if solve_mode == "audio":
                 token = self._solve_audio_challenge(page, timeout)
@@ -788,9 +859,11 @@ class RecaptchaSolver:
         """内部方法：解决图片挑战"""
         self._load_models()
         start_time = time.time()
-        # 每轮已压到约 4~5s，30 轮的上限反而先于时间上限触发。
-        # 放宽到 60，让 420s 的时间预算成为真正的约束。
-        max_retries = 60
+        # 轮数上限。配合"每次求解换出口 IP"使用：IP 新鲜时题链通常 2~12 轮，
+        # 抽到信誉差的 IP 时题链会病态地长（实测到 120 轮仍未完）。
+        # 因此定在 45：好 IP 绰绰有余，坏 IP 快速失败、交给上层换节点重试，
+        # 而不是耗满整个时间预算。
+        max_retries = int(os.environ.get("V2_MAX_RETRIES", "45"))
         current_try = 0
         clicked_indices_history: Set[int] = set()
         last_category = None
@@ -1523,6 +1596,20 @@ class RecaptchaSolver:
         return None
     
     @staticmethod
+    def _safe_query(frame, selector):
+        """查询 frame 内元素，失败按"查不到"处理，返回 None
+
+        挑战 iframe 会自行导航/重载，此时 frame 的执行上下文被销毁，
+        query_selector / content_frame 都会抛
+        "Execution context was destroyed, most likely because of a navigation"。
+        一次瞬时导航不该把整次求解判死——返回 None 让主循环下一轮重试。
+        """
+        try:
+            return frame.query_selector(selector)
+        except Exception:
+            return None
+
+    @staticmethod
     def _looks_like_audio(data: Optional[bytes]) -> bool:
         """粗判是不是音频：图片与音频 payload 同路径，拿到 JPEG 时早报错更省事"""
         if not data or len(data) < 100:
@@ -1656,8 +1743,14 @@ class RecaptchaSolver:
                 if not anchor_clicked:
                     print("   ⚠️ 验证框点击失败，本轮跳过")
             
-            bf_el = page.query_selector(bframe_sel)
-            bframe = bf_el.content_frame() if bf_el else None
+            try:
+                bf_el = page.query_selector(bframe_sel)
+                bframe = bf_el.content_frame() if bf_el else None
+            except Exception as e:
+                # iframe 正在导航，执行上下文被销毁，下一轮再来
+                print(f"❓ 取验证窗口失败({type(e).__name__})，等待后重试...")
+                time.sleep(1)
+                continue
             if not bframe:
                 print("❓ 验证窗口未找到，等待...")
                 time.sleep(1)
@@ -1665,7 +1758,7 @@ class RecaptchaSolver:
             cf = page.frame_locator(bframe_sel)
             
             # 切到语音挑战：图片挑战里才有 #recaptcha-audio-button
-            if bframe.query_selector("#audio-response") is None:
+            if self._safe_query(bframe, "#audio-response") is None:
                 try:
                     btn = cf.locator("#recaptcha-audio-button").first
                     if btn.count() > 0:
@@ -1673,11 +1766,14 @@ class RecaptchaSolver:
                         btn.click(timeout=CLICK_TIMEOUT_MS)
                         captured.clear()  # 丢掉图片挑战阶段抓到的 payload
                         time.sleep(1.5)
-                        bf_el = page.query_selector(bframe_sel)
-                        bframe = bf_el.content_frame() if bf_el else None
+                        try:
+                            bf_el = page.query_selector(bframe_sel)
+                            bframe = bf_el.content_frame() if bf_el else None
+                        except Exception:
+                            bframe = None
                         # 切过去之后音频 payload 还要下载，等 src 真正挂上
                         for _ in range(20):
-                            if bframe and bframe.query_selector("#audio-source[src]"):
+                            if bframe and self._safe_query(bframe, "#audio-source[src]"):
                                 break
                             time.sleep(0.3)
                 except Exception as e:
@@ -1685,7 +1781,7 @@ class RecaptchaSolver:
                     time.sleep(1)
                     continue
             
-            if not bframe or bframe.query_selector("#audio-response") is None:
+            if not bframe or self._safe_query(bframe, "#audio-response") is None:
                 print("   ⚠️ 音频挑战未就绪，等待...")
                 time.sleep(1)
                 continue
@@ -1838,6 +1934,8 @@ if __name__ == "__main__":
     ap.add_argument("--headless", action="store_true", help="无头模式（默认有头）")
     ap.add_argument("--timeout", type=int, default=DEFAULT_SOLVE_TIMEOUT)
     ap.add_argument("--proxy", default=PROXY, help="如 http://127.0.0.1:7890，留空为直连")
+    ap.add_argument("--nodes", default="",
+                    help='出口节点列表（Clash 节点名，用 ;; 分隔），失败时自动换节点重试')
     ap.add_argument("--min-interval", type=float, default=MIN_SOLVE_INTERVAL,
                     help="连续求解的最小间隔秒数，0=不限制")
     args = ap.parse_args()
@@ -1850,8 +1948,10 @@ if __name__ == "__main__":
     
     t0 = time.time()
     try:
+        nodes = [n.strip() for n in args.nodes.split(";;") if n.strip()] if args.nodes else None
         with RecaptchaSolver(headless=args.headless, mode=args.mode,
-                            proxy=args.proxy, min_interval=args.min_interval) as solver:
+                            proxy=args.proxy, min_interval=args.min_interval,
+                            nodes=nodes) as solver:
             token = solver.solve(args.sitekey, args.url, args.timeout)
         print(f"\n🎉 成功! 耗时 {time.time()-t0:.1f}s")
         print(f"Token 长度: {len(token)}")
