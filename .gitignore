@@ -1,0 +1,18 @@
+# 模型权重（体积大，首次运行会自动下载）
+*.pt
+*.pth
+
+# 运行时产物
+debug_screenshots/
+debug_audio/
+diag_shots_old/
+ref_shots/
+__pycache__/
+*.pyc
+.cache/
+
+# 运行日志（含 token，勿提交）
+*.log
+*.jsonl
+results.md
+summary.md

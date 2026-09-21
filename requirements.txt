@@ -1,0 +1,27 @@
+# 实测版本 (Windows 11 / Python 3.13 / 2026-09-21, CPU-only)
+
+# --- 核心 ---
+camoufox[geoip]>=0.5.4          # 反检测浏览器
+playwright>=1.53.0
+ultralytics>=8.4.157            # YOLO 目标检测
+transformers>=5.17.0            # GroundingDINO 零样本检测
+torch>=2.14.0                   # 无 GPU 时用 CPU 轮子:
+                                #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torchvision>=0.29.0             # 必须与 torch 同源同版本，否则报 operator torchvision::nms does not exist
+opencv-python>=5.0.0
+pillow>=12.0
+numpy>=2.0
+
+# --- 音频模式 ---
+faster-whisper>=1.2.1           # 默认后端：CPU int8，自带解码，不需要外部 ffmpeg
+openai-whisper>=20250625        # 可选后备后端（需要 PATH 上有 ffmpeg）
+imageio-ffmpeg>=0.6.0           # 仅 openai-whisper 后端需要：提供 ffmpeg 二进制
+httpx>=0.28.1
+
+# 安装后还需:
+#   python -m camoufox fetch      # 下载 Camoufox 浏览器（国内需走代理）
+#
+# 首次运行会自动下载:
+#   yolo11x.pt                          ~110MB  GitHub releases
+#   IDEA-Research/grounding-dino-tiny   ~700MB  HuggingFace
+#   faster-whisper base.en              ~145MB  HuggingFace
